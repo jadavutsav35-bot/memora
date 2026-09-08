@@ -1,93 +1,16 @@
-import express from 'express';
-import bcrypt from 'bcryptjs';
-import { pool } from './db.js';
-import { requireAuth, signUser } from './auth.js';
-import { requireAlbumMember } from './access.js';
-
-const router=express.Router();
-
-router.post('/auth/register',async(req,res)=>{
-  try{
-    const {name,email,password}=req.body;
-    if(!name||!email||!password||password.length<6) return res.status(400).json({error:'Name, email and password (6+ chars) are required'});
-    const hash=await bcrypt.hash(password,12);
-    const r=await pool.query(`INSERT INTO users(name,email,password_hash) VALUES($1,$2,$3) RETURNING id,name,email`,[name,email.toLowerCase(),hash]);
-    res.status(201).json({user:r.rows[0],token:signUser(r.rows[0])});
-  }catch(e){res.status(400).json({error:e.code==='23505'?'Email already registered':'Registration failed'});}
-});
-
-router.post('/auth/login',async(req,res)=>{
-  const {email,password}=req.body;
-  const r=await pool.query(`SELECT * FROM users WHERE email=$1`,[email?.toLowerCase()]);
-  if(!r.rowCount || !(await bcrypt.compare(password,r.rows[0].password_hash))) return res.status(401).json({error:'Invalid email or password'});
-  const u=r.rows[0]; res.json({user:{id:u.id,name:u.name,email:u.email},token:signUser(u)});
-});
-
-router.get('/albums',requireAuth,async(req,res)=>{
-  const r=await pool.query(`SELECT a.*, count(DISTINCT am2.user_id)::int members,
-    count(DISTINCT m.id)::int memories
-    FROM albums a JOIN album_members am ON am.album_id=a.id
-    LEFT JOIN album_members am2 ON am2.album_id=a.id
-    LEFT JOIN memories m ON m.album_id=a.id
-    WHERE am.user_id=$1 GROUP BY a.id ORDER BY a.created_at DESC`,[req.user.id]);
-  res.json(r.rows);
-});
-
-router.post('/albums',requireAuth,async(req,res)=>{
-  const {name,description,location,startDate,endDate}=req.body;
-  const client=await pool.connect();
-  try{
-    await client.query('BEGIN');
-    const a=await client.query(`INSERT INTO albums(name,description,location,start_date,end_date,created_by) VALUES($1,$2,$3,$4,$5,$6) RETURNING *`,
-      [name,description||null,location||null,startDate||null,endDate||null,req.user.id]);
-    await client.query(`INSERT INTO album_members(album_id,user_id,role) VALUES($1,$2,'owner')`,[a.rows[0].id,req.user.id]);
-    await client.query('COMMIT'); res.status(201).json(a.rows[0]);
-  }catch(e){await client.query('ROLLBACK');res.status(400).json({error:'Could not create album'});}finally{client.release();}
-});
-
-router.get('/albums/:id',requireAuth,requireAlbumMember,async(req,res)=>{
-  const a=await pool.query(`SELECT a.*,u.name creator FROM albums a JOIN users u ON u.id=a.created_by WHERE a.id=$1`,[req.params.id]);
-  if(!a.rowCount)return res.status(404).json({error:'Album not found'});
-  const members=await pool.query(`SELECT u.id,u.name,u.email,am.role FROM album_members am JOIN users u ON u.id=am.user_id WHERE am.album_id=$1`,[req.params.id]);
-  res.json({...a.rows[0],members:members.rows});
-});
-
-router.get('/albums/:id/memories',requireAuth,requireAlbumMember,async(req,res)=>{
-  const r=await pool.query(`SELECT m.*,u.name author,
-    COALESCE((SELECT json_agg(md ORDER BY md.created_at) FROM media md WHERE md.memory_id=m.id),'[]') media,
-    COALESCE((SELECT json_agg(c ORDER BY c.created_at) FROM comments c WHERE c.memory_id=m.id),'[]') comments
-    FROM memories m JOIN users u ON u.id=m.user_id WHERE m.album_id=$1 ORDER BY m.memory_date DESC`,[req.params.id]);
-  res.json(r.rows);
-});
-
-router.post('/albums/:id/memories',requireAuth,requireAlbumMember,async(req,res)=>{
-  const {title,story,location,memoryDate}=req.body;
-  const r=await pool.query(`INSERT INTO memories(album_id,user_id,title,story,location,memory_date) VALUES($1,$2,$3,$4,$5,COALESCE($6,NOW())) RETURNING *`,
-    [req.params.id,req.user.id,title||null,story||null,location||null,memoryDate||null]);
-  res.status(201).json(r.rows[0]);
-});
-
-router.post('/memories/:id/comments',requireAuth,async(req,res)=>{
-  const {commentText}=req.body;
-  const check=await pool.query(`SELECT 1 FROM memories m JOIN album_members am ON am.album_id=m.album_id WHERE m.id=$1 AND am.user_id=$2`,[req.params.id,req.user.id]);
-  if(!check.rowCount)return res.status(403).json({error:'Access denied'});
-  const r=await pool.query(`INSERT INTO comments(memory_id,user_id,comment_text) VALUES($1,$2,$3) RETURNING *`,[req.params.id,req.user.id,commentText]);
-  res.status(201).json(r.rows[0]);
-});
-
-router.post('/memories/:id/reactions',requireAuth,async(req,res)=>{
-  const type=req.body.reactionType||'heart';
-  const check=await pool.query(`SELECT 1 FROM memories m JOIN album_members am ON am.album_id=m.album_id WHERE m.id=$1 AND am.user_id=$2`,[req.params.id,req.user.id]);
-  if(!check.rowCount)return res.status(403).json({error:'Access denied'});
-  await pool.query(`INSERT INTO reactions(memory_id,user_id,reaction_type) VALUES($1,$2,$3) ON CONFLICT(memory_id,user_id) DO UPDATE SET reaction_type=EXCLUDED.reaction_type`,[req.params.id,req.user.id,type]);
-  res.json({ok:true});
-});
-
-router.post('/albums/:id/invite',requireAuth,requireAlbumMember,async(req,res)=>{
-  if(!['owner','admin'].includes(req.albumRole))return res.status(403).json({error:'Only owners/admins can invite'});
-  const {email}=req.body;
-  const r=await pool.query(`INSERT INTO invitations(album_id,invited_by,email,expires_at) VALUES($1,$2,$3,NOW()+INTERVAL '7 days') RETURNING token,email`,[req.params.id,req.user.id,email]);
-  res.status(201).json({message:'Invitation created. Send this token through your email service.',...r.rows[0]});
-});
-
-export default router;
+const express=require('express'),bcrypt=require('bcryptjs'),crypto=require('crypto'),multer=require('multer'),pool=require('./db');
+const {signUser,authRequired}=require('./auth');const {requireAlbumMember}=require('./access');const {uploadBuffer,signedUrl}=require('./storage');const r=express.Router();const upload=multer({storage:multer.memoryStorage(),limits:{fileSize:100*1024*1024}});
+const pub=u=>({id:u.id,name:u.name,email:u.email,avatar_url:u.avatar_url});
+r.post('/auth/register',async(q,s,n)=>{try{const{name,email,password}=q.body;if(!name||!email||!password)return s.status(400).json({error:'Name, email and password are required'});if(password.length<6)return s.status(400).json({error:'Password must be at least 6 characters'});if((await pool.query('select id from users where lower(email)=lower($1)',[email])).rows.length)return s.status(409).json({error:'Email already registered'});const h=await bcrypt.hash(password,12),x=(await pool.query('insert into users(name,email,password_hash) values($1,$2,$3) returning id,name,email,avatar_url',[name.trim(),email.trim().toLowerCase(),h])).rows[0];s.json({token:signUser(x),user:pub(x)})}catch(e){n(e)}});
+r.post('/auth/login',async(q,s,n)=>{try{const u=(await pool.query('select * from users where lower(email)=lower($1)',[q.body.email||''])).rows[0];if(!u||!(await bcrypt.compare(q.body.password||'',u.password_hash)))return s.status(401).json({error:'Invalid email or password'});s.json({token:signUser(u),user:pub(u)})}catch(e){n(e)}});
+r.get('/me',authRequired,async(q,s,n)=>{try{s.json({user:pub((await pool.query('select id,name,email,avatar_url from users where id=$1',[q.user.id])).rows[0])})}catch(e){n(e)}});
+r.get('/albums',authRequired,async(q,s,n)=>{try{s.json({albums:(await pool.query(`select a.*,am.role,(select count(*) from album_members x where x.album_id=a.id) member_count,(select count(*) from memories m where m.album_id=a.id) memory_count from albums a join album_members am on am.album_id=a.id where am.user_id=$1 order by a.created_at desc`,[q.user.id])).rows})}catch(e){n(e)}});
+r.post('/albums',authRequired,async(q,s,n)=>{const c=await pool.connect();try{const{name,description,event_date,location}=q.body;if(!name)return s.status(400).json({error:'Album name is required'});await c.query('begin');const a=(await c.query('insert into albums(owner_id,name,description,event_date,location) values($1,$2,$3,$4,$5) returning *',[q.user.id,name.trim(),description||'',event_date||null,location||''])).rows[0];await c.query(`insert into album_members(album_id,user_id,role) values($1,$2,'owner')`,[a.id,q.user.id]);await c.query('commit');s.json({album:a})}catch(e){await c.query('rollback');n(e)}finally{c.release()}});
+r.get('/albums/:id',authRequired,requireAlbumMember,async(q,s,n)=>{try{s.json({album:(await pool.query('select * from albums where id=$1',[q.params.id])).rows[0],members:(await pool.query(`select u.id,u.name,u.email,am.role from album_members am join users u on u.id=am.user_id where am.album_id=$1`,[q.params.id])).rows})}catch(e){n(e)}});
+r.post('/albums/:id/memories',authRequired,requireAlbumMember,upload.fields([{name:'media',maxCount:20},{name:'voice',maxCount:1}]),async(q,s,n)=>{const c=await pool.connect();try{const{story,song_title,song_url}=q.body,fs=q.files?.media||[],vf=q.files?.voice?.[0];if(!fs.length&&!story&&!vf&&!song_url)return s.status(400).json({error:'Add a photo/video, story, voice memory or song'});await c.query('begin');const m=(await c.query('insert into memories(album_id,user_id,story) values($1,$2,$3) returning *',[q.params.id,q.user.id,story||''])).rows[0];for(const f of fs){const type=f.mimetype.startsWith('video/')?'video':'image';if(!['image','video'].includes(type))continue;const safe=f.originalname.replace(/[^a-zA-Z0-9._-]/g,'_'),path=`${q.params.id}/${m.id}/${crypto.randomUUID()}-${safe}`;await uploadBuffer(f.buffer,path,f.mimetype);await c.query('insert into media(memory_id,media_type,media_url,file_name) values($1,$2,$3,$4)',[m.id,type,path,f.originalname])}if(vf){const safe=vf.originalname.replace(/[^a-zA-Z0-9._-]/g,'_'),path=`${q.params.id}/${m.id}/voice-${crypto.randomUUID()}-${safe}`;await uploadBuffer(vf.buffer,path,vf.mimetype||'audio/webm');await c.query('insert into voice_memories(memory_id,audio_url) values($1,$2)',[m.id,path])}if(song_url)await c.query('insert into songs(memory_id,title,song_url) values($1,$2,$3)',[m.id,song_title||'Song',song_url]);await c.query('commit');s.json({memory:m})}catch(e){await c.query('rollback');n(e)}finally{c.release()}});
+r.get('/albums/:id/memories',authRequired,requireAlbumMember,async(q,s,n)=>{try{const ms=(await pool.query(`select m.*,u.name author_name from memories m join users u on u.id=m.user_id where m.album_id=$1 order by m.created_at desc`,[q.params.id])).rows,out=[];for(const m of ms){const media=(await pool.query('select * from media where memory_id=$1 order by created_at',[m.id])).rows;const voice=(await pool.query('select * from voice_memories where memory_id=$1 limit 1',[m.id])).rows[0]||null;const song=(await pool.query('select * from songs where memory_id=$1 limit 1',[m.id])).rows[0]||null;const comments=(await pool.query(`select c.*,u.name from comments c join users u on u.id=c.user_id where c.memory_id=$1 order by c.created_at`,[m.id])).rows;for(const x of media)x.signed_url=await signedUrl(x.media_url);if(voice)voice.signed_url=await signedUrl(voice.audio_url);out.push({...m,media,voice,song,comments})}s.json({memories:out})}catch(e){n(e)}});
+r.post('/memories/:id/comments',authRequired,async(q,s,n)=>{try{if(!q.body.text?.trim())return s.status(400).json({error:'Comment cannot be empty'});const a=await pool.query(`select 1 from memories m join album_members am on am.album_id=m.album_id where m.id=$1 and am.user_id=$2`,[q.params.id,q.user.id]);if(!a.rows.length)return s.status(403).json({error:'Access denied'});s.json({comment:(await pool.query('insert into comments(memory_id,user_id,text) values($1,$2,$3) returning *',[q.params.id,q.user.id,q.body.text.trim()])).rows[0]})}catch(e){n(e)}});
+r.post('/memories/:id/reactions',authRequired,async(q,s,n)=>{try{await pool.query(`insert into reactions(memory_id,user_id,reaction) values($1,$2,$3) on conflict(memory_id,user_id) do update set reaction=excluded.reaction`,[q.params.id,q.user.id,q.body.reaction||'❤️']);s.json({ok:true})}catch(e){n(e)}});
+r.post('/albums/:id/invite',authRequired,requireAlbumMember,async(q,s,n)=>{try{if(q.album.role!=='owner')return s.status(403).json({error:'Only the owner can invite'});const t=crypto.randomBytes(24).toString('hex');await pool.query('insert into invitations(album_id,invited_by,token) values($1,$2,$3)',[q.params.id,q.user.id,t]);s.json({token:t,invite_link:`${process.env.CLIENT_URL}/?invite=${t}`})}catch(e){n(e)}});
+r.post('/invitations/:token/accept',authRequired,async(q,s,n)=>{try{const i=(await pool.query('select * from invitations where token=$1',[q.params.token])).rows[0];if(!i)return s.status(404).json({error:'Invalid invitation'});await pool.query(`insert into album_members(album_id,user_id,role) values($1,$2,'member') on conflict(album_id,user_id) do nothing`,[i.album_id,q.user.id]);s.json({album_id:i.album_id})}catch(e){n(e)}});
+r.get('/health',(q,s)=>s.json({ok:true,service:'memora-api',version:'2'}));r.use((e,q,s,n)=>{console.error(e);s.status(500).json({error:e.message||'Server error'})});module.exports=r;
