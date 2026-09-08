@@ -1,17 +1,1 @@
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import router from './routes.js';
-dotenv.config();
-const app=express();
-app.use(cors({origin:process.env.CLIENT_URL||'http://localhost:5173'}));
-app.use(express.json({limit:'2mb'}));
-const __dirname=path.dirname(fileURLToPath(import.meta.url));
-app.use('/uploads',express.static(path.join(__dirname,'../uploads')));
-app.get('/api/health',(req,res)=>res.json({ok:true,service:'memora-api'}));
-app.use('/api',router);
-app.use((err,req,res,next)=>{console.error(err);res.status(500).json({error:'Internal server error'});});
-const port=process.env.PORT||5000;
-app.listen(port,()=>console.log(`Memora API running on http://localhost:${port}`));
+require('dotenv').config();const express=require('express');const cors=require('cors');const routes=require('./routes');const app=express();app.use(cors({origin:process.env.CLIENT_URL||true,credentials:true}));app.use(express.json({limit:'2mb'}));app.use('/api',routes);app.listen(process.env.PORT||5000,()=>console.log('Memora API running'));
